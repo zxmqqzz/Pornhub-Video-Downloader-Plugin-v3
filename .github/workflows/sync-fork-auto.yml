@@ -1,103 +1,97 @@
-name: Sync Forked Repos
+name: 自动同步Fork
 
 on:
-  schedule:
-    - cron: '0 16 * * *' # 每天 UTC 时间 16:00（即北京时间凌晨 00:00）运行一次
-  workflow_dispatch: # 手动触发工作流
+  workflow_dispatch:   # 手动触发，推荐
+   schedule:
+     - cron: '0 0 * * *'  # 可选：每天 UTC 00:00 自动同步
 
 jobs:
-  sync-forks:
+  sync-fork:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: Checkout the code
+      # ----------------------------------------------
+      # Step 1: 获取当前仓库信息，并查询上游（源）仓库
+      # ----------------------------------------------
+      - name: Get current repository info
+        id: repo_info
+        run: |
+          echo "当前仓库: ${{ github.repository }}"
+          echo "仓库所有者: ${{ github.repository_owner }}"
+          echo "仓库名称: ${{ github.event.repository.name }}"
+
+          REPO_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/${{ github.repository }})
+
+          DEFAULT_BRANCH=$(echo "$REPO_INFO" | jq -r '.default_branch')
+          IS_FORK=$(echo "$REPO_INFO" | jq -r '.fork')
+
+          if [ "$IS_FORK" != "true" ]; then
+            echo "❌ 当前仓库不是 Fork 仓库，无法自动检测源仓库。"
+            echo "✅ 请确认你已手动 Fork 了某个上游仓库。"
+            exit 1
+          fi
+
+          UPSTREAM_FULL_NAME=$(echo "$REPO_INFO" | jq -r '.parent.full_name')
+          echo "检测到源仓库（上游）: $UPSTREAM_FULL_NAME"
+          echo "当前仓库默认分支: $DEFAULT_BRANCH"
+
+          echo "upstream_full_name=$UPSTREAM_FULL_NAME" >> $GITHUB_OUTPUT
+          echo "target_repo=${{ github.repository }}" >> $GITHUB_OUTPUT
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+      # ----------------------------------------------
+      # Step 2: Checkout 你的 Fork 仓库（使用自动检测的默认分支）
+      # ----------------------------------------------
+      - name: Checkout your fork (自动分支)
         uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.repo_info.outputs.default_branch }}
+          token: ${{ secrets.MY_GIT_TOKEN }}
+          fetch-depth: 0
 
-      - name: Set timezone to Asia/Shanghai
+      - name: Set Git Identity
         run: |
-          echo "Setting timezone to Asia/Shanghai"
-          sudo timedatectl set-timezone Asia/Shanghai
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Display current time
+      # ----------------------------------------------
+      # Step 3: 获取源仓库信息并设置远程
+      # ----------------------------------------------
+      - name: Add upstream remote (源仓库)
         run: |
-          echo "Current time in Beijing: $(date)"
+          UPSTREAM_REPO=${{ steps.repo_info.outputs.upstream_full_name }}
+          echo "添加远程源仓库: $UPSTREAM_REPO"
 
-      - name: Set up GitHub CLI
+          UPSTREAM_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/$UPSTREAM_REPO)
+          UPSTREAM_DEFAULT_BRANCH=$(echo "$UPSTREAM_INFO" | jq -r '.default_branch')
+          echo "源仓库默认分支: $UPSTREAM_DEFAULT_BRANCH"
+
+          git remote add upstream https://github.com/$UPSTREAM_REPO.git
+
+          echo "upstream_default_branch=$UPSTREAM_DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Fetch upstream（代码 + Tags）
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gh jq
+          UPSTREAM_DEFAULT_BRANCH=${{ steps.repo_info.outputs.upstream_default_branch }}
+          echo "🔁 获取源仓库代码和 Tags（分支: $UPSTREAM_DEFAULT_BRANCH）"
+          git fetch upstream --tags
 
-      - name: Run the Sync Forked Repos script
+      - name: Push all tags to your fork
         run: |
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Fetching the list of repositories for OWNER: $OWNER..."
-            # 获取同步前的仓库列表和更新时间
-            before_sync_repos=$(gh repo list "$OWNER" --limit 200 --fork --json nameWithOwner,isFork,updatedAt)
-            
-            # 初始化错误计数器和仓库列表
-            error_count=0
-            failed_repos=()
-            synced_repos=()
-            
-            # 遍历所有fork仓库进行同步
-            while read -r repo; do
-                nameWithOwner=$(echo "$repo" | jq -r '.nameWithOwner')
-                before_updated_at=$(echo "$repo" | jq -r '.updatedAt')
-                
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Syncing forked repository: $nameWithOwner..."
-                
-                # 尝试同步仓库
-                if gh repo sync "$nameWithOwner" 2>&1; then
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Successfully synced: $nameWithOwner"
-                    # 记录成功同步的仓库和其同步前的更新时间
-                    synced_repos+=("$nameWithOwner|$before_updated_at")
-                else
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to sync: $nameWithOwner" >&2
-                    error_count=$((error_count + 1))
-                    failed_repos+=("$nameWithOwner")
-                fi
-            done < <(echo "$before_sync_repos" | jq -c '.[]')
-            
-            # 等待10秒让GitHub API更新状态
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Waiting for GitHub API to update..."
-            sleep 10
-            
-            # 检查已同步仓库的更新状态
-            updated_repos=()
-            for repo_info in "${synced_repos[@]}"; do
-                nameWithOwner="${repo_info%|*}"
-                before_updated_at="${repo_info#*|}"
-                
-                # 获取当前更新时间
-                after_updated_at=$(gh repo view "$nameWithOwner" --json updatedAt | jq -r '.updatedAt')
-                
-                # 比较更新时间
-                if [ "$before_updated_at" != "$after_updated_at" ]; then
-                    updated_repos+=("$nameWithOwner")
-                fi
-            done
-            
-            # 显示同步结果
-            echo ""
-            echo "--------------------------------"
-            # 显示更新的仓库
-            echo "Check the repository update status..."
-            if [ ${#updated_repos[@]} -gt 0 ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Repositories with updates from upstream:"
-                printf '%s\n' "${updated_repos[@]}"
-                echo ""
-            fi
-            
-            # 显示失败的仓库
-            if [ $error_count -gt 0 ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] Sync completed with $error_count failures"
-                echo "Failed repositories:"
-                printf '%s\n' "${failed_repos[@]}"
-                exit 1
-            else
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] All repositories synced successfully"
-            fi
-            echo "--------------------------------"
+          git push origin --tags
 
-        env:
-            GH_TOKEN: ${{ secrets.SYNC_GITHUB_TOKEN }}
-            OWNER: ${{ github.repository_owner }}
+      - name: Merge upstream/{{ steps.repo_info.outputs.upstream_default_branch }}
+        run: |
+          UPSTREAM_DEFAULT_BRANCH=${{ steps.repo_info.outputs.upstream_default_branch }}
+          echo "🔀 合并源仓库分支: upstream/$UPSTREAM_DEFAULT_BRANCH"
+          git merge upstream/$UPSTREAM_DEFAULT_BRANCH --allow-unrelated-histories -X theirs || echo "Already up-to-date or no changes"
+
+      - name: Push code to your fork (当前默认分支)
+        run: |
+          DEFAULT_BRANCH=${{ steps.repo_info.outputs.default_branch }}
+          echo "📤 推送代码到你的 fork（分支: $DEFAULT_BRANCH）"
+          git remote set-url origin https://${{ secrets.MY_GIT_TOKEN }}@github.com/${{ github.repository }}.git
+          git push origin $DEFAULT_BRANCH
