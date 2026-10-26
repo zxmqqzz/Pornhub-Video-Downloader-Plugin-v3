@@ -1,16 +1,48 @@
 name: 自动同步Fork
 
 on:
-  push: # push 时触发, 主要是为了测试配置有没有问题
   schedule:
-    - cron: '* */3 * * *' # 每3小时触发, 对于一些更新不那么频繁的项目可以设置为每天一次, 低碳一点
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPOSITORY: webLiang/Pornhub-Video-Downloader-Plugin-v3
+  UPSTREAM_BRANCH: master
+  TARGET_BRANCH: master
+
 jobs:
-  repo-sync:
+  sync:
+    name: Sync fork
     runs-on: ubuntu-latest
+
     steps:
-      - uses: TG908/fork-sync@v1.6.3
+      - name: Checkout target branch
+        uses: actions/checkout@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          owner: webLiang/Pornhub-Video-Downloader-Plugin-v3 # fork 的上游仓库 user
-          head: master # fork 的上游仓库 branch
-          base: master # 本地仓库 branch
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPOSITORY }}.git
+          git remote -v
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+      - name: Merge upstream into fork
+        run: |
+          git merge upstream/${{ env.UPSTREAM_BRANCH }}
+
+      - name: Push changes
+        run: |
+          git push origin ${{ env.TARGET_BRANCH }}
